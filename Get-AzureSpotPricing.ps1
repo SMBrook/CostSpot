@@ -95,116 +95,99 @@ function Get-SpotEvictionRates {
         return @{}
     }
     
-    Write-Host "  Fetching Spot eviction rates (placement scores)..." -ForegroundColor Gray
+    Write-Host "  Fetching Spot eviction rates..." -ForegroundColor Gray
     
     try {
-        # Query one SKU at a time instead of batches to avoid API errors
         $evictionRates = @{}
         $failedSkus = @()
         
+        # Initial delay to let API stabilize
+        Start-Sleep -Milliseconds 500
+        
         foreach ($sku in $SkuList) {
             $retryCount = 0
-            $maxRetries = 5
+            $maxRetries = 4
             $success = $false
             
             while (-not $success -and $retryCount -le $maxRetries) {
                 try {
-                    # Add jitter to avoid synchronized requests
-                    $jitter = Get-Random -Minimum 100 -Maximum 500
-                    Start-Sleep -Milliseconds $jitter
-                    
                     $desiredSize = @(@{sku = $sku})
-                    # Try with DesiredCount=10 which sometimes works better
-                    $response = Invoke-AzSpotPlacementScore -Location $RegionName -DesiredCount 10 -DesiredLocation @($RegionName) -DesiredSize $desiredSize -ErrorAction Stop
+                    $response = Invoke-AzSpotPlacementScore -Location $RegionName -DesiredCount 10 -DesiredLocation @($RegionName) -DesiredSize $desiredSize -ErrorAction Stop -WarningAction SilentlyContinue
                     
-                    if ($response.PlacementScore -and $response.PlacementScore.Count -gt 0) {
+                    if ($response.PlacementScore -and $response.PlacementScore.Count -gt 0 -and $response.PlacementScore[0].Score) {
                         $score = $response.PlacementScore[0]
-                        
-                        # Skip if no valid score returned
-                        if ($score.Score) {
-                            # Azure returns: High (best), Medium, Low, or None
-                            # Convert to eviction risk: High score = Low eviction risk
-                            $evictionRisk = switch ($score.Score) {
+                        $evictionRates[$sku] = @{
+                            Risk = switch ($score.Score) {
                                 'High' { 'Very Low' }
                                 'Medium' { 'Low-Medium' }
                                 'Low' { 'Medium-High' }
                                 'None' { 'High' }
                                 default { 'N/A' }
                             }
-                            # Estimate eviction percentage based on placement score
-                            $evictionPercent = switch ($score.Score) {
+                            Percent = switch ($score.Score) {
                                 'High' { '0-5%' }
                                 'Medium' { '5-15%' }
                                 'Low' { '15-30%' }
                                 'None' { '30%+' }
                                 default { 'N/A' }
                             }
-                            $evictionRates[$sku] = @{
-                                Risk = $evictionRisk
-                                Percent = $evictionPercent
-                            }
-                            Write-Verbose "Got placement score for $sku in $RegionName : $($score.Score)"
                         }
+                        Write-Verbose "✓ $sku : $($score.Score)"
+                        $success = $true
                     }
-                    $success = $true
                     
                 } catch {
                     $retryCount++
-                    $errorMsg = $_.Exception.Message
-                    if ($errorMsg -match "quota|throttl|rate limit|Expected|Parser") {
-                        if ($retryCount -le $maxRetries) {
-                            Write-Verbose "API error for $sku, waiting before retry $retryCount/$maxRetries..."
-                            # Exponential backoff with jitter: base + random
-                            $backoffSeconds = ($retryCount * 4) + (Get-Random -Minimum 1 -Maximum 4)
-                            Start-Sleep -Seconds $backoffSeconds
-                        } else {
-                            Write-Verbose "Failed to get score for $sku after $maxRetries retries"
-                            $failedSkus += $sku
-                        }
+                    if ($retryCount -le $maxRetries) {
+                        # Progressive backoff: 1s, 2s, 3s, 4s
+                        Start-Sleep -Seconds $retryCount
                     } else {
-                        Write-Verbose "Query failed for $sku : $errorMsg"
                         $failedSkus += $sku
-                        break
                     }
                 }
             }
+            
+            # Consistent delay between requests
+            if (-not $success) {
+                Start-Sleep -Milliseconds 800
+            } else {
+                Start-Sleep -Milliseconds 400
+            }
         }
         
-        # Second pass: retry failed SKUs with longer delay
+        # Second pass for failed SKUs with longer delays
         if ($failedSkus.Count -gt 0 -and $failedSkus.Count -le 5) {
-            Write-Verbose "Retrying $($failedSkus.Count) failed SKUs after cooldown..."
-            Start-Sleep -Seconds 10
+            Write-Verbose "Second pass: retrying $($failedSkus.Count) failed SKUs..."
+            Start-Sleep -Seconds 5
             
             foreach ($sku in $failedSkus) {
                 try {
                     $desiredSize = @(@{sku = $sku})
-                    $response = Invoke-AzSpotPlacementScore -Location $RegionName -DesiredCount 10 -DesiredLocation @($RegionName) -DesiredSize $desiredSize -ErrorAction Stop
+                    $response = Invoke-AzSpotPlacementScore -Location $RegionName -DesiredCount 10 -DesiredLocation @($RegionName) -DesiredSize $desiredSize -ErrorAction Stop -WarningAction SilentlyContinue
                     
                     if ($response.PlacementScore -and $response.PlacementScore.Count -gt 0 -and $response.PlacementScore[0].Score) {
                         $score = $response.PlacementScore[0]
-                        $evictionRisk = switch ($score.Score) {
-                            'High' { 'Very Low' }
-                            'Medium' { 'Low-Medium' }
-                            'Low' { 'Medium-High' }
-                            'None' { 'High' }
-                            default { 'N/A' }
-                        }
-                        $evictionPercent = switch ($score.Score) {
-                            'High' { '0-5%' }
-                            'Medium' { '5-15%' }
-                            'Low' { '15-30%' }
-                            'None' { '30%+' }
-                            default { 'N/A' }
-                        }
                         $evictionRates[$sku] = @{
-                            Risk = $evictionRisk
-                            Percent = $evictionPercent
+                            Risk = switch ($score.Score) {
+                                'High' { 'Very Low' }
+                                'Medium' { 'Low-Medium' }
+                                'Low' { 'Medium-High' }
+                                'None' { 'High' }
+                                default { 'N/A' }
+                            }
+                            Percent = switch ($score.Score) {
+                                'High' { '0-5%' }
+                                'Medium' { '5-15%' }
+                                'Low' { '15-30%' }
+                                'None' { '30%+' }
+                                default { 'N/A' }
+                            }
                         }
-                        Write-Verbose "Retry successful for $sku : $($score.Score)"
+                        Write-Verbose "✓ $sku : $($score.Score) (retry)"
                     }
                     Start-Sleep -Seconds 2
                 } catch {
-                    Write-Verbose "Retry also failed for $sku"
+                    # Silent fail on second pass
                 }
             }
         }
@@ -361,7 +344,7 @@ if ($results.Count -eq 0) {
     Write-Host "  - Verify the region names (e.g., 'eastus', 'westeurope', 'uksouth')" -ForegroundColor Gray
     Write-Host "  - Check the SKU filter patterns (e.g., 'Standard_D*s_v5', 'Standard_E*')" -ForegroundColor Gray
 } else {
-    $results | ForEach-Object {
+    $tableData = $results | ForEach-Object {
         [PSCustomObject]@{
             'VM SKU' = $_.SKU
             'OS' = $_.OS
@@ -372,10 +355,51 @@ if ($results.Count -eq 0) {
             'Eviction Risk' = $_.EvictionRate
             'Eviction Rate %' = $_.EvictionPercent
         }
-    } | Format-Table -AutoSize
+    }
+    
+    $tableData | Format-Table -AutoSize
     
     Write-Host "`nTotal SKUs found: $($results.Count)" -ForegroundColor Cyan
     Write-Host "Total regions queried: $($Region.Count)" -ForegroundColor Cyan
-    Write-Host "`nTo export to CSV, run:" -ForegroundColor Gray
-    Write-Host ".\Get-AzureSpotPricing.ps1 -Region '$($Region -join "','")' -SkuFilter '$($SkuFilter -join "','")' | Export-Csv -Path 'pricing.csv' -NoTypeInformation" -ForegroundColor Gray
+    
+    # Auto-export to Excel
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $excelPath = Join-Path $PSScriptRoot "AzureSpotPricing_$timestamp.xlsx"
+    
+    try {
+        # Check if ImportExcel module is available
+        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+            Write-Host "`nInstalling ImportExcel module..." -ForegroundColor Yellow
+            Install-Module -Name ImportExcel -Scope CurrentUser -Force -AllowClobber
+        }
+        
+        Import-Module ImportExcel -ErrorAction Stop
+        
+        # Export to Excel with formatting
+        $excelData = $results | ForEach-Object {
+            [PSCustomObject]@{
+                'VM SKU' = $_.SKU
+                'OS' = $_.OS
+                'Region' = $_.Region
+                'Spot ($/hr)' = if ($_.SpotPrice) { $_.SpotPrice } else { $null }
+                'PayAsYouGo ($/hr)' = if ($_.PayAsYouGo) { $_.PayAsYouGo } else { $null }
+                'Savings' = $_.Savings
+                'Eviction Risk' = $_.EvictionRate
+                'Eviction Rate %' = $_.EvictionPercent
+            }
+        }
+        
+        $excelData | Export-Excel -Path $excelPath -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow `
+            -WorksheetName "Spot Pricing" -TableName "SpotPricing" -TableStyle Medium2
+        
+        Write-Host "`n✓ Exported to Excel: $excelPath" -ForegroundColor Green
+        
+    } catch {
+        Write-Host "`nFailed to export to Excel: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "Exporting to CSV instead..." -ForegroundColor Gray
+        
+        $csvPath = Join-Path $PSScriptRoot "AzureSpotPricing_$timestamp.csv"
+        $tableData | Export-Csv -Path $csvPath -NoTypeInformation
+        Write-Host "✓ Exported to CSV: $csvPath" -ForegroundColor Green
+    }
 }
